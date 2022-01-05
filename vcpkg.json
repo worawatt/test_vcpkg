@@ -1,0 +1,8 @@
+{
+    "name": "versions-test",
+    "version": "1.0.0",
+    "dependencies": [
+        "boost-asio"
+    ],
+    "builtin-baseline": "abf52dd1adb482e21fb89d1125d4fed6b79dfc07"
+}
