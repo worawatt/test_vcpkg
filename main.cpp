@@ -1,117 +1,95 @@
-//
-// async_tcp_echo_server.cpp
-// ~~~~~~~~~~~~~~~~~~~~~~~~~
-//
-// Copyright (c) 2003-2021 Christopher M. Kohlhoff (chris at kohlhoff dot com)
-//
-// Distributed under the Boost Software License, Version 1.0. (See accompanying
-// file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
-//
-
-#include <cstdlib>
-#include <iostream>
-#include <memory>
-#include <utility>
 #include <boost/asio.hpp>
 
-using boost::asio::ip::tcp;
+#include <iostream>
+#include <memory>
+#include <queue>
 
-class session
-    : public std::enable_shared_from_this<session>
+struct item_base
 {
-public:
-    session(tcp::socket socket)
-        : socket_(std::move(socket))
-    {
-    }
-
-    void start()
-    {
-        do_read();
-    }
-
-private:
-    void do_read()
-    {
-        auto self(shared_from_this());
-        socket_.async_read_some(boost::asio::buffer(data_, max_length),
-                                [this, self](boost::system::error_code ec, std::size_t length)
-                                {
-                                    if (!ec)
-                                    {
-                                        do_write(length);
-                                    }
-                                });
-    }
-
-    void do_write(std::size_t length)
-    {
-        auto self(shared_from_this());
-        boost::asio::async_write(socket_, boost::asio::buffer(data_, length),
-                                 [this, self](boost::system::error_code ec, std::size_t /*length*/)
-                                 {
-                                     if (!ec)
-                                     {
-                                         do_read();
-                                     }
-                                 });
-    }
-
-    tcp::socket socket_;
-    enum
-    {
-        max_length = 1024
-    };
-    char data_[max_length];
+    void (*execute_)(std::shared_ptr<item_base> &);
 };
 
-class server
+template <class Func>
+struct item : item_base
 {
-public:
-    server(boost::asio::io_context &io_context, short port)
-        : acceptor_(io_context, tcp::endpoint(tcp::v4(), port))
+    item(Func f) : function_(std::move(f))
     {
-        do_accept();
-    }
-
-private:
-    void do_accept()
-    {
-        acceptor_.async_accept(
-            [this](boost::system::error_code ec, tcp::socket socket)
-            {
-                if (!ec)
-                {
-                    std::make_shared<session>(std::move(socket))->start();
-                }
-
-                do_accept();
-            });
-    }
-
-    tcp::acceptor acceptor_;
-};
-
-int main(int argc, char *argv[])
-{
-    try
-    {
-        if (argc != 2)
+        execute_ = [](std::shared_ptr<item_base> &p)
         {
-            std::cerr << "Usage: async_tcp_echo_server <port>\n";
-            return 1;
-        }
-
-        boost::asio::io_context io_context;
-
-        server s(io_context, std::atoi(argv[1]));
-
-        io_context.run();
+            Func tmp(std::move(static_cast<item *>(p.get())->function_));
+            p.reset();
+            tmp();
+        };
     }
-    catch (std::exception &e)
+
+    Func function_;
+};
+
+typedef std::queue<std::shared_ptr<item_base>> queue_t;
+
+template <class Func>
+void queue_submit(queue_t& q, Func f)
+{
+    q.push(std::make_shared<item<Func>>(std::move(f)));
+}
+
+struct minimal_io_executor
+{
+    boost::asio::execution_context *context_;
+    queue_t& queue_;
+
+    bool operator==(const minimal_io_executor &other) const noexcept
     {
-        std::cerr << "Exception: " << e.what() << "\n";
+        return context_ == other.context_ && queue_ == other.queue_;
     }
 
+    bool operator!=(const minimal_io_executor &other) const noexcept
+    {
+        return !(*this == other);
+    }
+
+    boost::asio::execution_context &query(
+        boost::asio::execution::context_t) const noexcept
+    {
+        return *context_;
+    }
+
+    static constexpr boost::asio::execution::blocking_t::never_t query(
+        boost::asio::execution::blocking_t) noexcept
+    {
+        // This executor always has blocking.never semantics.
+        return boost::asio::execution::blocking.never;
+    }
+
+    template <class F>
+    void execute(F f) const
+    {
+        queue_submit(queue_, std::move(f));
+    }
+};
+
+int main()
+{
+    boost::asio::execution_context context;
+    queue_t queue;
+    minimal_io_executor executor{&context, queue};
+
+    boost::asio::co_spawn(
+        executor, []() -> boost::asio::awaitable<void> {
+            std::cout << "1" << std::endl;
+            auto ex = co_await boost::asio::this_coro::executor;
+            std::cout << "2" << std::endl;
+            co_await boost::asio::post(ex, boost::asio::use_awaitable);
+            std::cout << "3" << std::endl;
+            co_return;
+        },
+        boost::asio::detached);
+
+    while (!queue.empty()) {
+        auto p(queue.front());
+        queue.pop();
+        std::cout << "pop" << std::endl;
+        p->execute_(p);
+    }
     return 0;
 }
